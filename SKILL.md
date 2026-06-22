@@ -117,6 +117,8 @@ SNAP_DIR=$(mktemp -d /tmp/acl-snapshots-XXXXXX)
 | Rollback to clean | `git checkout -- . && git clean -fd` (no apply — returns to pre-loop state) |
 | Cleanup | `rm -rf $SNAP_DIR` (in Summarize) |
 
+**External state warning:** `git checkout` only rolls back file changes. It does NOT reverse environmental side-effects — database migrations, populated caches, installed packages, or seed data. If the verify command or Modify step mutates external state (e.g., runs migrations, installs deps, populates a DB), log it in the progress notes and warn the user during Summarize. When possible, scope verify commands to avoid side-effects (e.g., `pytest --no-header` instead of a full `make setup && pytest`).
+
 **When to snapshot:**
 - After Baseline: save as `baseline.patch` (pre-edit state)
 - After each Verify run: save as `attempt-N.patch` **only if the score improved over the previous best** — regressions are not saved
@@ -169,6 +171,8 @@ If the user requests revisions, update the plan and confirm once more. Max 1 rev
 
 **Re-plan arrow:** If Step 2 (Search) reveals the plan is wrong or incomplete (e.g., a key file doesn't exist, an assumption was wrong, a better approach is obvious), return to Step 1 with the new context. Max 1 re-plan. If the second plan is also invalidated by Search, stop and recommend `/grill-with-docs` with status `OUT_OF_SCOPE`.
 
+> **Boundary:** This re-plan limit applies specifically to *Search invalidating Plan* (the agent discovers structural facts about the codebase that contradict the plan). It does NOT apply to constraints discovered during Modify or Repair — those are implementation-level issues handled by the Repair step and, if thrashing, by the Anti-Patterns section. Context drift mid-implementation (e.g., a compiler error reveals an unforeseen constraint) is normal repair work, not a re-plan.
+
 Use `todo_write` to track the plan as actionable steps the user can see.
 
 ### 2. Search
@@ -209,6 +213,18 @@ Run the user-supplied command via `run_shell_command`. Capture stdout, stderr, e
 - **Warnings:** non-fatal issues
 - **Score:** quantitative metric (e.g., "7/10 tests passing", "2 errors remaining")
 
+**Score calculation by verify type:**
+| Verify command type | Score formula | Example |
+|---------------------|---------------|---------|
+| Test runner (`pytest`, `npm test`, `go test`) | `passed / total` | 7/10 tests passing |
+| Linter/formatter (`ruff`, `eslint`, `gofmt`) | `1 / (1 + error_count)` — higher is better, approaches 1.0 as errors approach 0 | 1/(1+3) = 0.25 → fix 2 → 1/(1+1) = 0.5 → delta +0.25 |
+| Compiler/type checker (`tsc --noEmit`, `cargo check`) | `1 / (1 + error_count)` | 1/(1+5) = 0.17 |
+| Coverage tool (`coverage`, `c8`) | `coverage_percentage` | 85% |
+| Build command (`npm run build`, `make`) | Binary: `1` (pass) or `0` (fail) | 0 → 1 on fix |
+| Custom script | Count meaningful output lines as errors, use `1 / (1 + count)` | — |
+
+The goal: every verify type produces a comparable, directionally-correct number. Deltas between attempts show real progress.
+
 **Judge:**
 - **Pass** — exit 0 AND output matches expected behavior
 - **Fail** — anything else
@@ -237,10 +253,26 @@ git diff > $SNAP_DIR/attempt-<N>.patch
 ```
 
 ### 5. Review (only on Verify Pass)
-Self-critique the solution. Re-read the diff and ask:
+Self-critique the solution. Re-read the diff and run through each rubric:
+
+**Correctness:**
 - Does the solution actually solve the task, or just make tests pass?
+- Are there edge cases or failure modes not covered by tests?
+
+**Security:**
+- Does the diff introduce hardcoded secrets, open endpoints, or injection vectors?
+- Does it handle user input at system boundaries?
+
+**Performance:**
+- Are there stray `console.log`/`print` statements, unused imports, or debug artifacts?
+- Any obvious algorithmic regressions (e.g., O(n²) where O(n) was before)?
+
+**Coverage parity:**
+- If a new feature was added, was a matching test added — or did it pass only because existing tests didn't cover the new code?
+- Did the diff reduce test coverage (removed assertions, disabled checks)?
+
+**Minimalism:**
 - Is the diff minimal and focused, or does it include unrelated changes?
-- Are there any edge cases or failure modes not covered by tests?
 - Would this change pass a human code review?
 
 If the review finds issues, either:
