@@ -1,6 +1,6 @@
 ---
 name: agentic-coding-loop
-description: Run a structured 8-step agentic coding loop (Baseline → Plan → Search → Modify → Verify → Review → Repair → Summarize) on a task in the current project, with baseline tracking, quantitative progress monitoring, reward hacking detection, and up to 3 auto-repair attempts. Use when the user asks to "run the agentic loop", "loop engineer this", wants plan→act→verify→repair on a coding task, or invokes this skill directly.
+description: Run a structured 8-step agentic coding loop (Baseline → Plan → Search → Modify → Verify → Review → Repair → Summarize) on a task in the current project, with scope classification (tactical/medium/strategic), plan confirmation, re-plan on search invalidation, baseline tracking, quantitative progress monitoring, reward hacking detection, and up to 3 auto-repair attempts. Use when the user asks to "run the agentic loop", "loop engineer this", wants plan→act→verify→repair on a coding task, or invokes this skill directly.
 ---
 
 # Agentic Coding Loop
@@ -79,7 +79,26 @@ If a timeout is set, track elapsed time and check at each Verify checkpoint. If 
 
 ## The Loop
 
-Run the 8 steps in order. **Verify is gating** — only proceed to Review on pass, then to Summarize.
+Run the steps in order. **Verify is gating** — only proceed to Review on pass, then to Summarize.
+
+### Scope Gate (before any work)
+
+After Inputs are resolved, classify the task before running the loop. Inspect the task description and run a quick `git diff --stat HEAD` + `grep_search` for relevant files to estimate blast radius.
+
+| Signal | Scope | Action |
+|--------|-------|--------|
+| Single file, clear fix, test exists or trivial to add | **Tactical** | Proceed directly to Baseline |
+| Multi-file, design choice needed, no obvious single approach | **Medium** | Run Steps 0–1 (Baseline + Plan), then **ask user to confirm plan** before proceeding. Allow 1 re-plan if Search invalidates it. |
+| Feature-level, architectural, ambiguous, or spans multiple concerns | **Strategic** | **STOP.** Recommend the user run a planning skill first: `/spec-to-ship` (full lifecycle), `/grill-with-docs` (decisions + docs), or `/to-prd` → `/to-issues` (spec → work items). Return to this loop on a single resulting issue. |
+
+**Present the classification to the user** with the reasoning, and offer:
+- "Proceed (scope looks right)"
+- "Override — I know the scope, just run the loop"
+- "Escalate — run /spec-to-ship first"
+
+If the user overrides, respect it — but log the override in the Summarize report.
+
+**Re-plan trigger:** At any point during Search (Step 2), if the agent discovers the plan from Step 1 is wrong or incomplete, return to Step 1 with the new context. **Max 1 re-plan.** If the second plan is also invalidated by Search, escalate to Strategic scope and recommend `/grill-with-docs`.
 
 ### 0. Baseline
 Run the verify command **before any edits**. Record:
@@ -100,6 +119,18 @@ This is your reference point. All subsequent repairs must improve relative to th
 
 ### 1. Plan
 Decompose the task into concrete, ordered steps. Output a numbered list. Each step = one coherent edit OR one verification action. Do not start editing until the plan could paste cleanly into a PR description.
+
+**Plan confirmation (Medium scope only):**
+After outputting the plan, use `ask_user_question` to confirm:
+- "Proceed with this plan"
+- "Revise — <custom instructions>"
+- "Abort"
+
+If the user requests revisions, update the plan and confirm once more. Max 1 revision round — if the user wants further changes, recommend `/grill-with-docs`.
+
+**Re-plan arrow:** If Step 2 (Search) reveals the plan is wrong or incomplete (e.g., a key file doesn't exist, an assumption was wrong, a better approach is obvious), return to Step 1 with the new context. Max 1 re-plan. If the second plan is also invalidated by Search, stop and recommend `/grill-with-docs` with status `OUT_OF_SCOPE`.
+
+Use `todo_write` to track the plan as actionable steps the user can see.
 
 ### 2. Search
 Find files, symbols, tests, and conventions relevant to the plan. Use `grep_search`, `glob`, `read_file`. Note:
@@ -243,18 +274,42 @@ Stop early and summarize with the matching status if:
 - **Endless polishing** — continuing to revise after verify passes and review is clean → stop, ship it
 - **Sandbox bypass** — repair attempts to disable safety flags or modify test infrastructure "for efficiency" → stop with status `UNSAFE`
 
-## Example
+## Examples
+
+### Tactical (single file, clear fix)
 
 User: *"Add a `/health` endpoint that returns 200 with `{ok: true}`. Verify with `pytest tests/test_health.py`."*
 
-1. **Baseline:** run pytest — fails (0/1 tests, file not found). Score: 0/1.
-2. **Plan:** (1) add route handler, (2) add test, (3) verify
-3. **Search:** read existing route patterns, find test fixtures. Action space: editable=[`app.py`, `tests/test_health.py`], read-only=[`conftest.py`], off-limits=[`pytest.ini`, other test files]
-4. **Modify:** add the handler, add the test
-5. **Verify:** run pytest — fails (0/1 tests, import error). Score: 0/1. Delta: 0.
-6. **Repair:** fix the import, re-run pytest — passes (1/1 tests). Score: 1/1. Delta: +1.
-7. **Review:** re-read diff — handler is minimal, test covers the happy path, no edge cases. Diff is clean.
-8. **Summarize:** status DONE, baseline 0/1, final 1/1, files changed, review notes
+1. **Scope Gate:** Single file change, clear spec, test path given → **Tactical**. No confirmation needed.
+2. **Baseline:** run pytest — fails (0/1 tests, file not found). Score: 0/1.
+3. **Plan:** (1) add route handler, (2) add test, (3) verify
+4. **Search:** read existing route patterns, find test fixtures. Action space: editable=[`app.py`, `tests/test_health.py`], read-only=[`conftest.py`], off-limits=[`pytest.ini`, other test files]
+5. **Modify:** add the handler, add the test
+6. **Verify:** run pytest — fails (0/1 tests, import error). Score: 0/1. Delta: 0.
+7. **Repair:** fix the import, re-run pytest — passes (1/1 tests). Score: 1/1. Delta: +1.
+8. **Review:** re-read diff — handler is minimal, test covers the happy path, no edge cases. Diff is clean.
+9. **Summarize:** status DONE, baseline 0/1, final 1/1, files changed, review notes
+
+### Medium (multi-file, re-plan triggered)
+
+User: *"Add rate limiting to all API routes. Verify with `npm test`."*
+
+1. **Scope Gate:** Multi-file (middleware + routes + config), design choice (per-route vs global, token bucket vs sliding window) → **Medium**.
+2. **Baseline:** run `npm test` — 45/45 passing. Score: 45/45. Status: PASS (green field).
+3. **Plan (v1):** (1) create `middleware/rateLimit.ts`, (2) apply globally in `app.ts`, (3) add config to `config.ts`, (4) write tests
+4. **Search:** discovers `app.ts` uses a plugin architecture, not middleware. Existing rate limiter already exists in `plugins/throttle.ts` but is disabled. → **Re-plan triggered.**
+5. **Plan (v2):** (1) enable `plugins/throttle.ts`, (2) configure limits in `config/throttle.json`, (3) add tests for throttle behavior
+6. **User confirms v2** — proceeds.
+7. **Search (v2):** read plugin registration, config schema, existing throttle tests
+8. **Modify → Verify → Repair** (standard loop)
+9. **Summarize:** status DONE, note re-plan in review notes
+
+### Strategic (escalated)
+
+User: *"Refactor the auth system from sessions to JWT with refresh tokens."*
+
+1. **Scope Gate:** Spans auth middleware, session store, token management, database schema, all protected routes, frontend token handling → **Strategic**.
+2. **STOP.** Recommend: "This is a multi-concern architectural change. Run `/grill-with-docs` to nail down token strategy (JWT vs opaque, refresh rotation, revocation), then `/to-issues` to break it into vertical slices. Come back to `/agentic-coding-loop` for each slice."
 
 ## References
 
