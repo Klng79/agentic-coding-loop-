@@ -5,8 +5,8 @@
   </p>
   <p align="center">
     <a href="#compatibility"><img src="https://img.shields.io/badge/AI_Agent-Universal-blue?style=flat-square" alt="AI Agent Universal" /></a>
-    <a href="https://github.com/Klng79/agentic-coding-loop-/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" /></a>
-    <a href="https://github.com/Klng79/agentic-coding-loop-/stargazers"><img src="https://img.shields.io/github/stars/Klng79/agentic-coding-loop-?style=flat-square" alt="Stars" /></a>
+    <a href="https://github.com/Klng79/agentic-coding-loop/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" /></a>
+    <a href="https://github.com/Klng79/agentic-coding-loop/stargazers"><img src="https://img.shields.io/github/stars/Klng79/agentic-coding-loop?style=flat-square" alt="Stars" /></a>
   </p>
 </p>
 
@@ -112,11 +112,11 @@ The skill actively detects and handles:
 ```bash
 # Global install (available in all projects)
 cd ~/.qwen/skills
-git clone https://github.com/Klng79/agentic-coding-loop-.git agentic-coding-loop
+git clone https://github.com/Klng79/agentic-coding-loop.git agentic-coding-loop
 
 # Per-project install
 cd your-project/.qwen/skills
-git clone https://github.com/Klng79/agentic-coding-loop-.git agentic-coding-loop
+git clone https://github.com/Klng79/agentic-coding-loop.git agentic-coding-loop
 ```
 
 Restart Qwen Code. Done.
