@@ -1,636 +1,324 @@
 ---
 name: agentic-coding-loop
-description: Run a structured 8-step agentic coding loop (Baseline → Plan → Search → Modify → Verify → Review → Repair → Summarize) on a task in the current project, with scope classification (tactical/medium/strategic), plan confirmation, re-plan on search invalidation, baseline tracking, quantitative progress monitoring, reward hacking detection, and up to 3 auto-repair attempts. Supports two execution modes: subagent mode (delegates Search/Modify/Verify/Review to subagents for context protection — Qwen Code) and inline mode (all steps in main agent context — universal). Use when the user asks to "run the agentic loop", "loop engineer this", wants plan→act→verify→repair on a coding task, or invokes this skill directly.
+description: Run a structured 8-step agentic coding loop (Baseline → Plan → Search → Modify → Verify → Review → Repair → Summarize) with scope classification, plan confirmation, re-plan on search invalidation, baseline tracking, quantitative progress monitoring, reward hacking detection, and up to 3 auto-repair attempts. Supports subagent mode (Qwen Code) and inline mode (universal). Use when user says "run the agentic loop", "loop engineer this", wants plan→act→verify→repair, or invokes this skill.
 ---
 
 # Agentic Coding Loop
 
-A self-correcting workflow for non-trivial coding tasks. The first answer is rarely the final answer — this loop forces verify-and-repair before claiming done.
-
-Incorporates patterns from frontier autonomous coding systems: baseline-first execution (EPOCH), quantitative progress tracking (STOP/autoresearch), reward hacking detection (AlphaEvolve/AAR findings), self-critique review (AI Scientist), and solution archiving (STOP/SePO).
+A self-correcting workflow for non-trivial coding tasks. Forces verify-and-repair before claiming done. Patterns from: EPOCH (baseline-first), STOP (quantitative tracking), autoresearch (time budgets), AI Scientist (self-critique), SePO (archive policy), AlphaEvolve/AAR (reward hacking), Gödel Agent (action space).
 
 ## Inputs (auto-suggest, then ask)
 
-Before starting, use `ask_user_question` to get four things from the user. Auto-detect candidates, present them as options, and let the user pick one or type their own — the tool always provides an **"Other"** option for custom input.
+Use `ask_user_question` to get four things. Auto-detect candidates, present as options, user picks or types their own.
 
-**Skip rules:**
-- If the user already specified the task in their slash command (e.g. `/agentic-coding-loop add a /health endpoint`), skip the task question and go straight to verify.
-- If both task and verify are already in the slash command, skip to the timeout question.
-- If all four are already specified, skip the Inputs section entirely.
-- Execution mode (Input 4) is never skipped silently — always ask if subagent capability is detected, since the user may prefer inline mode even on Qwen Code.
+**Skip rules:** If task is in the slash command, skip to verify. If task+verify are specified, skip to timeout. If all four specified, skip entirely. Execution mode is never skipped silently — always ask if subagent capability detected.
 
-### 1. Task — auto-suggest candidates, then ask
+### 1. Task
 
-Run these in parallel to find candidates:
+Run in parallel: `git status --porcelain` + `git diff --stat HEAD`, `grep_search` for `TODO\|FIXME\|XXX` (limit 5), `git log -n 3 --oneline`, grep README/PRD for "Roadmap"/"TODO" sections.
 
-| Signal | Command |
+> Failing tests surface in Baseline (Step 0) after verify command is selected — avoids circular dependency.
+
+Present 2–4 options: "Continue uncommitted work in `app.py`", "Fix failing test in `tests/test_health.py`", "Implement TODO at `src/auth.py:42`", "Refactor `app.py`". If empty project: "Set up from scratch", "Add a feature", "Fix a bug".
+
+### 2. Verify command
+
+Auto-detect by project config, first match wins:
+
+| Project signal | Verify command |
 |---|---|
-| Uncommitted changes | `git status --porcelain` and `git diff --stat HEAD` |
-| Open TODOs / FIXMEs | `grep_search` for `TODO\|FIXME\|XXX` in source files (limit 5) |
-| Recent commits | `git log -n 3 --oneline` |
-| Project roadmap | grep README/PRD for "Next steps", "Roadmap", "TODO" sections |
-
-> **Note:** Failing tests are surfaced later in Baseline (Step 0), after the verify command has been selected. This avoids a circular dependency where task suggestion would require the verify command that hasn't been chosen yet.
-
-Present 2–4 task options, e.g.:
-
-- "Continue uncommitted work in `app.py`, `graph.py`"
-- "Fix the failing test in `tests/test_health.py`"
-- "Implement the open TODO at `src/auth.py:42`"
-- "Refactor `app.py` (last touched 2 days ago)"
-
-If the project is empty or has no detectable signals, present generic options:
-
-- "Set up the project from scratch"
-- "Add a new feature (specify below)"
-- "Fix a bug (specify below)"
-
-### 2. Verify command — auto-suggest, then ask
-
-Auto-detect by inspecting project config. Use the first match in this order:
-
-| Project signal | Proposed verify command |
-|---|---|
-| `pyproject.toml` with `[tool.pytest]`, or `pytest.ini`, or `conftest.py` | `pytest` |
-| `package.json` with `scripts.test` | `npm test` |
-| `package.json` with `scripts.build` and a `tsconfig.json` | `npm run build && npm test` |
-| `Makefile` with `test:` target | `make test` |
+| `pyproject.toml` `[tool.pytest]` / `pytest.ini` / `conftest.py` | `pytest` |
+| `package.json` `scripts.test` | `npm test` |
+| `package.json` `scripts.build` + `tsconfig.json` | `npm run build && npm test` |
+| `Makefile` `test:` | `make test` |
 | `tsconfig.json` | `tsc --noEmit` |
-| `pyproject.toml` with `[tool.ruff]` | `ruff check . && pytest` |
+| `pyproject.toml` `[tool.ruff]` | `ruff check . && pytest` |
 | `requirements.txt` (no test config) | `python -m py_compile $(git diff --name-only HEAD)` |
 | Nothing detected (JS/TS) | `node -c $(git diff --name-only HEAD)` |
 
-Present the **top 2–3 candidates** as options, each labeled with what was detected, e.g.:
-
-- `pytest` *(detected: pyproject.toml has [tool.pytest])*
-- `ruff check . && pytest` *(detected: pyproject.toml has [tool.ruff] + pytest)*
-- `python -m py_compile $(git diff --name-only HEAD)` *(minimal syntax-only)*
-
-Confirm once, then reuse the same command across all Repair iterations — do not re-ask.
+Present top 2–3 candidates labeled with what was detected. Confirm once, reuse across all Repair iterations.
 
 ### 3. Time budget — optional
 
-Ask if the user wants to set a time limit for the entire loop. Present options:
+Options: "No timeout", "15 min", "30 min", "1 hour". If set, check at each Verify checkpoint. If exceeded → `TIMEOUT`.
 
-- "No timeout (run until done or blocked)"
-- "15 minutes"
-- "30 minutes"
-- "1 hour"
+### 4. Execution mode
 
-If a timeout is set, track elapsed time and check at each Verify checkpoint. If exceeded, summarize with status `TIMEOUT`.
-
-### 4. Execution mode — auto-detect, then ask
-
-Detect whether the `agent` tool (subagent spawning) is available in the current environment. This determines whether steps can delegate to subagents.
-
-**Auto-detect:**
-- If running in Qwen Code (which provides the `agent` tool), default to **Subagent mode**.
-- If running in an agent that does not support subagent spawning (Claude Code without subagents, Cursor, Cline, Aider, etc.), silently use **Inline mode** — do not ask.
-
-**Ask (only if subagent capability is detected):**
-
-- "Subagent mode (recommended) — delegates Search, Modify, Verify, and Review to subagents, protecting main agent context for state tracking and decisions"
-- "Inline mode — all steps run in main agent context (agent-agnostic, works on any tool)"
-
-Store the choice as `MODE` (value: `subagent` or `inline`) for use throughout the loop.
-
-> **Portability note:** Inline mode is the universal fallback. The skill works identically on any agent in inline mode — subagent mode is an optimization for Qwen Code that protects the main agent's context window.
+If Qwen Code (has `agent` tool) → default **Subagent mode**, ask user. Otherwise silently use **Inline mode**. Store as `MODE`. Inline is the universal fallback; subagent is a Qwen Code optimization.
 
 ## The Loop
 
-Run the steps in order. **Verify is gating** — only proceed to Review on pass, then to Summarize.
+**Verify is gating** — only proceed to Review on pass, then Summarize.
 
 ### Scope Gate (before any work)
 
-After Inputs are resolved, classify the task before running the loop. Inspect the task description and run a quick `git diff --stat HEAD` + `grep_search` for relevant files to estimate blast radius.
+Classify the task. Inspect description + `git diff --stat HEAD` + `grep_search` for blast radius.
 
-| Signal | Scope | Action |
-|--------|-------|--------|
-| Single file, clear fix, test exists or trivial to add | **Tactical** | Proceed directly to Baseline |
-| Multi-file, design choice needed, no obvious single approach | **Medium** | Run Steps 0–1 (Baseline + Plan), then **ask user to confirm plan** before proceeding. Allow 1 re-plan if Search invalidates it. |
-| Feature-level, architectural, ambiguous, or spans multiple concerns | **Strategic** | **STOP.** Recommend the user run a planning skill first: `/spec-to-ship` (full lifecycle), `/grill-with-docs` (decisions + docs), or `/to-prd` → `/to-issues` (spec → work items). Return to this loop on a single resulting issue. |
+| Scope | Signal | Action |
+|---|---|---|
+| **Tactical** | Single file, clear fix, test exists/trivial | Proceed directly to Baseline |
+| **Medium** | Multi-file, design choice needed | Run Steps 0–1, **ask user to confirm plan**. 1 re-plan allowed if Search invalidates. |
+| **Strategic** | Feature-level, architectural, ambiguous | **STOP.** Recommend `/spec-to-ship`, `/grill-with-docs`, or `/to-prd` → `/to-issues`. Return on a single issue. |
 
-**Present the classification to the user** with the reasoning, and offer:
-- "Proceed (scope looks right)"
-- "Override — I know the scope, just run the loop"
-- "Escalate — run /spec-to-ship first"
+Present classification + reasoning. Offer: "Proceed", "Override — just run the loop", "Escalate — /spec-to-ship first". Log overrides in Summarize.
 
-If the user overrides, respect it — but log the override in the Summarize report.
-
-**Re-plan trigger:** At any point during Search (Step 2), if the agent discovers the plan from Step 1 is wrong or incomplete, return to Step 1 with the new context. **Max 1 re-plan.** If the second plan is also invalidated by Search, escalate to Strategic scope and recommend `/grill-with-docs`.
+**Re-plan:** If Search discovers plan is wrong, return to Step 1. Max 1 re-plan; if second plan also invalidated → `OUT_OF_SCOPE` + recommend `/grill-with-docs`. Applies to *Search invalidating Plan* only — implementation constraints during Modify/Repair are normal repair work.
 
 ### Loop Pattern (after Scope Gate, before Baseline)
 
-Detect the dominant feedback signal from the verify command and task description. The loop pattern shapes how Verify parses output and how Repair diagnoses — the 8 steps stay the same, but the *observation lens* changes.
+Detect dominant feedback signal. The 8 steps stay the same, but the *observation lens* changes.
 
-| Verify command | Task signal | Loop pattern | Observation lens |
-|---|---|---|---|
-| Test runner (`pytest`, `npm test`, `go test`) | Bug fix, feature, regression | **Test-Driven** | Pass/fail counts, assertion failures, tracebacks. Repair must confirm the test fails for the *right reason* before fixing. |
-| Type checker (`tsc --noEmit`, `cargo check`, `mypy`) | Migration, dependency upgrade, refactor | **Compiler-Driven** | Type errors, missing fields, incompatible signatures. Structural correctness only — does not prove product correctness. |
-| Runtime command (`npm run dev`, `python app.py`, `curl` script) | Runtime bug, integration issue | **Runtime Debugging** | Logs, stack traces, HTTP responses, exit codes. Repair forms a hypothesis → targeted change → observe → update hypothesis. |
-| User provides PR review comments | Post-PR fix, address review feedback | **Review-Driven** | Comment text. Categorize each comment as bug, product question, style preference, or out-of-scope. Treat comments as requirements, not blind suggestions. |
-| Browser/preview check (`playwright`, `cypress`, manual preview) | UI/frontend task, layout, accessibility | **Product Iteration** | Screenshots, DOM state, console errors, viewport behavior. Compare against design constraints, responsive checks, accessibility. |
+| Pattern | Trigger | Observation lens |
+|---|---|---|
+| **Test-Driven** | Test runner (`pytest`, `npm test`, `go test`) | Pass/fail counts, assertion failures, tracebacks. Confirm test fails for the *right reason*. |
+| **Compiler-Driven** | Type checker (`tsc`, `cargo check`, `mypy`) | Type errors, missing fields, incompatible signatures. Structural correctness only. |
+| **Runtime Debugging** | Runtime command (`npm run dev`, `python app.py`, `curl`) | Logs, stack traces, HTTP responses, exit codes. Hypothesis → change → observe → update. |
+| **Review-Driven** | PR review comments | Categorize each as bug, product question, style preference, out-of-scope. Treat as requirements. |
+| **Product Iteration** | Browser/preview (`playwright`, `cypress`, manual) | Screenshots, DOM state, console errors, viewport behavior. Compare against design constraints. |
 
-If the verify command spans multiple categories (e.g., `npm run build && npm test`), pick the pattern matching the **primary task signal** — the task description determines which observation lens matters most.
-
-State the detected pattern in the Baseline output:
-```
-## Loop Pattern: <pattern name>
-**Observation lens:** <one-line description>
-```
+If verify spans multiple categories, pick the **primary task signal**. State in Baseline output: `## Loop Pattern: <name> — Observation lens: <one-line>`
 
 ### State Management
 
-Rollback is real, not aspirational. Use `git diff` patches saved to a temp directory:
+Rollback via `git diff` patches in a temp dir:
 
-```
+```bash
 SNAP_DIR=$(mktemp -d /tmp/acl-snapshots-XXXXXX)
 ```
 
-**Snapshot operations:**
-| Action | Command |
+| Action | Command / When |
 |--------|---------|
-| Save current state | `git add -A && git diff --cached > $SNAP_DIR/<label>.patch && git reset -q` |
-| Rollback to a snapshot | `git checkout -- . && git clean -fd && git apply $SNAP_DIR/<label>.patch` |
-| Rollback to clean | `git checkout -- . && git clean -fd` (no apply — returns to pre-loop state) |
+| Save snapshot | `git add -A && git diff --cached > $SNAP_DIR/<label>.patch && git reset -q` |
+| Rollback to snapshot | `git checkout -- . && git clean -fd && git apply $SNAP_DIR/<label>.patch` |
+| Rollback to clean | `git checkout -- . && git clean -fd` |
 | Cleanup | `rm -rf $SNAP_DIR` (in Summarize) |
+| **When to snapshot** | After Baseline → `baseline.patch`; After each Verify → `attempt-N.patch` **only if score improved** |
+| **Best-known-good** | Highest-score attempt. If repair #N regresses, rollback to better patch before next fix. |
 
-**External state warning:** `git checkout` only rolls back file changes. It does NOT reverse environmental side-effects — database migrations, populated caches, installed packages, or seed data. If the verify command or Modify step mutates external state (e.g., runs migrations, installs deps, populates a DB), log it in the progress notes and warn the user during Summarize. When possible, scope verify commands to avoid side-effects (e.g., `pytest --no-header` instead of a full `make setup && pytest`).
+> `git add -A` stages all changes including untracked files, `git diff --cached` captures the full diff, `git reset -q` restores the index. Plain `git diff` misses untracked files.
 
-**When to snapshot:**
-- After Baseline: save as `baseline.patch` (pre-edit state)
-- After each Verify run: save as `attempt-N.patch` **only if the score improved over the previous best** — regressions are not saved
-- Before each Repair: current state is already captured by the previous snapshot
+> **External state:** `git checkout` only rolls back files — NOT DB migrations, caches, installed packages, or seed data. Log external mutations and warn in Summarize. Scope verify to avoid side-effects when possible.
 
-**Best-known-good:** The attempt with the highest score. If repair #N scores lower than a previous attempt, rollback to the better patch before applying the next fix. Track in the progress log:
+Progress log format:
 ```
 | Attempt | Score | Delta | Patch file       | Notes |
 |---------|-------|-------|------------------|-------|
 | 0       | 3/10  | —     | baseline.patch   | reference |
 | 1       | 5/10  | +2    | attempt-1.patch  | fixed import |
-| 2       | 4/10  | -1    | (not saved)      | regression → rollback to attempt-1.patch |
+| 2       | 4/10  | -1    | (not saved)      | regression → rollback to attempt-1 |
 ```
 
-**Context broker (subagent mode):** In subagent mode, the main agent is the sole keeper of loop state. Subagents are stateless — each spawn starts with zero context. The main agent must pass forward the relevant summaries between steps:
-- Search Results → Modify briefing (action space, patterns, blockers)
-- Modify Results → Review briefing (changed files)
-- Verify Results → Repair diagnosis (errors, score, reward hacking flags)
-- Review Findings → Summarize (remaining risks, review notes)
+**Context broker (subagent mode):** Main agent is sole keeper of loop state. Subagents are stateless. Pass forward: Search Results → Modify briefing, Modify Results → Review briefing, Verify Results → Repair diagnosis, Review Findings → Summarize. Store in context or `todo_write`.
 
-The main agent should store these summaries in its conversation context or `todo_write` — never assume a subagent remembers anything from a previous spawn.
+## Subagent Protocols (Subagent Mode Only)
 
-### Subagent Protocols (Subagent Mode Only)
+Four steps delegate. Each subagent starts with zero context — main agent passes a complete briefing and receives structured markdown. Main agent acts as **context broker**.
 
-When execution mode is **Subagent**, four steps delegate to subagents. Each subagent starts with zero context — the main agent must pass a complete briefing and receive a structured markdown return. The main agent acts as **context broker**: it holds summaries from each return and passes them forward (Search summary → Modify briefing, Modify results → Review briefing, Verify results → Repair diagnosis).
+### Search (`Explore` subagent)
 
-#### Search Protocol (`Explore` subagent)
+**Briefing:** Task, project root, plan steps. Find: files, symbols, tests, conventions, patterns to respect, tests covering area, files not to touch, blockers. Thoroughness: medium.
 
-**Briefing template:**
-```
-Task: <one-line task description>
-Project root: <absolute path>
-Plan steps: <numbered plan from Step 1>
-Find: files, symbols, tests, and conventions relevant to this plan. Identify:
-- Existing patterns the change must respect (naming, structure, framework conventions)
-- Tests that cover the area
-- Files that should NOT be touched (CI config, safety tooling, unrelated modules)
-- Any blockers that would prevent the plan from succeeding
-Thoroughness: medium
-```
+**Return:** `## Search Results` → Relevant files (path — why), Patterns & conventions, Tests covering area, Action space (Editable/Read-only/Off-limits), Blockers (or "none").
 
-**Return format:**
-```markdown
-## Search Results
-**Relevant files:** (file path — why it matters)
-**Patterns & conventions:** (naming, structure, framework patterns to follow)
-**Tests covering area:** (file paths, or "none found")
-**Action space:**
-- **Editable:** (list)
-- **Read-only:** (list)
-- **Off-limits:** (list)
-**Blockers:** (anything that would prevent the plan from succeeding, or "none")
-```
+Main agent: validate plan against action space + blockers → re-plan if invalidated.
 
-Main agent uses: validates plan against action space + blockers → triggers re-plan if blockers invalidate plan.
+### Modify (`general-purpose` subagent)
 
-#### Modify Protocol (`general-purpose` subagent)
+**Pre-condition:** Take git snapshot before spawning.
 
-> **Pre-condition:** Main agent takes a git snapshot **before** spawning this subagent.
+**Briefing:** Task, project root, plan steps, Search summary (pasted), specific edits per step, conventions (from Search), files to create (or "none"). Constraints: `edit` for surgical changes, `write_file` only for new files, match existing style, no drive-by refactors, don't touch off-limits.
 
-**Briefing template:**
-```
-Task: <one-line task description>
-Project root: <absolute path>
-Plan steps: <numbered plan from Step 1>
-Search summary: <paste Search Results from Step 2>
-Specific edits to make: <concrete instructions per plan step>
-Project conventions: <from Search Results — patterns & conventions>
-Files to create: <list, if any; otherwise "none">
-Constraints: Use edit for surgical changes, write_file only for new files. Match existing style. No drive-by refactors. Do not touch off-limits files.
-```
+**Return:** `## Modify Results` → Files changed (file — description), Edits applied (numbered), Issues encountered (or "none"), Files created (or "none").
 
-**Return format:**
-```markdown
-## Modify Results
-**Files changed:** (file — one-line description of change)
-**Edits applied:** (numbered list, one per logical change)
-**Issues encountered:** (anything unexpected — missing imports, broken patterns, or "none")
-**Files created:** (new files, or "none")
-```
+Main agent: proceed to Verify.
 
-Main agent uses: nothing further — proceeds to Verify (Verify will catch issues).
+### Verify (`general-purpose` subagent)
 
-#### Verify Protocol (`general-purpose` subagent)
+**Briefing:** Verify command, scoring formula (from Loop Pattern), loop pattern name, signals to parse.
 
-**Briefing template:**
-```
-Verify command: <the command to run>
-Scoring formula: <from Loop Pattern detection, e.g. "passed / total", "1 / (1 + error_count)", "binary 0/1">
-Loop pattern: <detected pattern name>
-What to parse: <what signals matter for this loop pattern, e.g. "pass/fail counts, assertion failures, tracebacks" for Test-Driven>
-Run the verify command via run_shell_command. Parse stdout + stderr into structured feedback.
-```
+**Return:** `## Verify Results` → Exit code, Status (PASS/FAIL), Score (e.g. "7/10"), Errors (file:line — message), Test results (pass/fail/skip), Warnings, Reward hacking flags (or "none").
 
-**Return format:**
-```markdown
-## Verify Results
-**Exit code:** (number)
-**Status:** PASS | FAIL
-**Score:** (metric, e.g. "7/10 tests passing", "0 errors", "85% coverage")
-**Errors:** (file:line — message, one per line; or "none")
-**Test results:** (pass/fail/skip counts, if applicable; or "N/A")
-**Warnings:** (non-fatal issues, or "none")
-**Reward hacking flags:** (list any concerns — diffs outside action space, weakened verify, modified test/CI files; or "none")
-```
+Main agent: Review (pass) or Repair (fail), track progress, save snapshot if improved, check reward hacking → UNSAFE if detected.
 
-Main agent uses: structured feedback to decide Review (pass) or Repair (fail), track progress log, save snapshot if score improved, check reward hacking flags → UNSAFE if detected.
+### Review (`code-reviewer` subagent)
 
-#### Review Protocol (`code-reviewer` subagent)
+**Briefing:** Task, project root, changed files (from Modify Results), action space (from Search Results), verify status. Review for: Correctness, Security, Performance, Coverage parity, Minimalism.
 
-**Briefing template:**
-```
-Task: <one-line task description>
-Project root: <absolute path>
-Changed files: <from Modify Results — files changed list>
-Action space: <from Search Results — editable/read-only/off-limits>
-Verify status: <PASS/FAIL and score from Verify Results>
-Review the diff for: Correctness (does it solve the task or just pass tests? edge cases?), Security (secrets, injection, open endpoints?), Performance (debug artifacts, algorithmic regressions?), Coverage parity (new feature → matching test? reduced coverage?), Minimalism (focused diff or unrelated changes?).
-```
+**Return:** `## Review Findings` → per-dimension assessment (or "no issues"), Severity summary: critical | warning | clean.
 
-**Return format:**
-```markdown
-## Review Findings
-**Correctness:** (assessment + any issues, or "no issues")
-**Security:** (assessment + any issues, or "no issues")
-**Performance:** (assessment + any issues, or "no issues")
-**Coverage parity:** (assessment + any issues, or "no issues")
-**Minimalism:** (assessment + any issues, or "no issues")
-**Severity summary:** critical | warning | clean
-```
+Main agent: clean → DONE, warning → flag in Summarize or fix+re-verify, critical → `OUT_OF_SCOPE` if significant, or fix+re-verify.
 
-Main agent uses: decides fix-now + re-verify (loop back to Modify + Verify subagents), flag-as-remaining-risk in Summarize, or OUT_OF_SCOPE if issues need significant additional work.
+## The 8 Steps
 
 ### 0. Baseline
-Run the verify command **before any edits**. Record:
-- Exit code
-- Output (test count, error count, coverage %, or other measurable signal)
-- Timestamp
 
-**Take the baseline snapshot:**
+Run verify command **before any edits**. Record exit code, output, timestamp. Take baseline snapshot:
 ```bash
 SNAP_DIR=$(mktemp -d /tmp/acl-snapshots-XXXXXX)
 git add -A && git diff --cached > $SNAP_DIR/baseline.patch && git reset -q
 ```
+Reference point for all repairs. If baseline passes, note "green field". If failing tests appear, consider "fix N failing tests" as a task candidate.
 
-> `git add -A` stages all changes including new files, `git diff --cached` captures the full diff, then `git reset -q` restores the index without touching the working tree. Plain `git diff` misses untracked files, which would break rollback for any new file the agent creates.
-
-This is your reference point. All subsequent repairs must improve relative to this baseline. If baseline already passes, note it and proceed to Plan with a "green field" status.
-
-> **Note for users:** If Baseline shows failing tests, consider adding "fix the N failing tests" as a task candidate — this is where failing-test signals surface (after verify command is selected, not during task auto-detection).
-
-**Output:**
-```
-## Baseline
-**Loop pattern:** <pattern name>
-**Verify command:** `<command>`
-**Exit code:** <code>
-**Score:** <metric> (e.g., "3/10 tests passing", "0 errors", "85% coverage")
-**Status:** PASS | FAIL
-```
+Output: `## Baseline` — Loop pattern, Verify command, Exit code, Score, Status (PASS/FAIL).
 
 ### 1. Plan
-Decompose the task into concrete, ordered steps. Output a numbered list. Each step = one coherent edit OR one verification action. Do not start editing until the plan could paste cleanly into a PR description.
 
-**Plan confirmation (Medium scope only):**
-After outputting the plan, use `ask_user_question` to confirm:
-- "Proceed with this plan"
-- "Revise — <custom instructions>"
-- "Abort"
+Decompose into concrete ordered steps. Each step = one coherent edit OR one verification action. Plan should paste cleanly into a PR description. Use `todo_write` to track.
 
-If the user requests revisions, update the plan and confirm once more. Max 1 revision round — if the user wants further changes, recommend `/grill-with-docs`.
+**Medium scope confirmation:** After plan, `ask_user_question`: "Proceed", "Revise — <instructions>", "Abort". Max 1 revision — further changes → recommend `/grill-with-docs`.
 
-**Re-plan arrow:** If Step 2 (Search) reveals the plan is wrong or incomplete (e.g., a key file doesn't exist, an assumption was wrong, a better approach is obvious), return to Step 1 with the new context. Max 1 re-plan. If the second plan is also invalidated by Search, stop and recommend `/grill-with-docs` with status `OUT_OF_SCOPE`.
-
-> **Boundary:** This re-plan limit applies specifically to *Search invalidating Plan* (the agent discovers structural facts about the codebase that contradict the plan). It does NOT apply to constraints discovered during Modify or Repair — those are implementation-level issues handled by the Repair step and, if thrashing, by the Anti-Patterns section. Context drift mid-implementation (e.g., a compiler error reveals an unforeseen constraint) is normal repair work, not a re-plan.
-
-Use `todo_write` to track the plan as actionable steps the user can see.
+**Re-plan:** If Search reveals plan is wrong, return here. Max 1 re-plan; second invalidation → `OUT_OF_SCOPE` + `/grill-with-docs`.
 
 ### 2. Search
 
-**If MODE = subagent:** Spawn an `Explore` subagent using the Search Protocol briefing (see Subagent Protocols → Search). Wait for the structured return. Use the returned action space and blockers to validate the plan. If blockers invalidate the plan → trigger re-plan (Step 1, max 1 re-plan). Store the Search Results for passing to Modify.
+**Subagent:** Spawn `Explore` with Search Protocol briefing. Validate plan against return → re-plan if invalidated. Store results for Modify.
 
-**If MODE = inline:** Use `grep_search`, `glob`, `read_file` to find files, symbols, tests, and conventions relevant to the plan. Note:
-- Existing patterns the change must respect
-- Tests that cover the area
-- Files that should NOT be touched
+**Inline:** Use `grep_search`, `glob`, `read_file` for files, symbols, tests, conventions. Note patterns to respect, tests covering area, files not to touch.
 
-**Define the action space** — explicitly classify files into three categories:
-- **Editable:** files you will modify
-- **Read-only:** files you need for context but won't touch
-- **Off-limits:** files that must not be modified (CI config, safety tooling, unrelated modules)
+**Action space:** Editable (will modify) / Read-only (context only) / Off-limits (CI config, safety tooling, unrelated modules).
 
-**Escape hatch:** If the task *explicitly* targets test infrastructure (e.g., "fix the broken fixtures", "refactor conftest"), those files move from Off-limits to Editable. Declare this in the action space output and note it in the plan.
-
-Output (inline mode):
-```
-## Action Space
-**Editable:** <list>
-**Read-only:** <list>
-**Off-limits:** <list>
-```
+> **Escape hatch:** If task explicitly targets test infrastructure ("fix fixtures", "refactor conftest"), those files move from Off-limits to Editable. Declare in action space output.
 
 ### 3. Modify
 
-**If MODE = subagent:** Take a git snapshot (`git add -A && git diff --cached > $SNAP_DIR/pre-modify.patch && git reset -q`). Spawn a `general-purpose` subagent using the Modify Protocol briefing (see Subagent Protocols → Modify), passing the Search Results from Step 2. Wait for the structured return. Proceed to Verify — do not inspect the diff yourself (Verify will catch issues).
+**Subagent:** Take snapshot. Spawn `general-purpose` with Modify Protocol briefing + Search Results. Wait for return. Proceed to Verify — don't inspect diff.
 
-**If MODE = inline:** Make the smallest coherent set of edits. One diff per logical change. Use `edit` for surgical changes, `write_file` only for new files. Match existing style — do not "improve" adjacent code. Reuse shared components, follow naming conventions, and avoid introducing new abstractions discovered during Search.
+**Inline:** Smallest coherent edits. One diff per logical change. `edit` for surgical changes, `write_file` only for new files. Match existing style — no improving adjacent code, no new abstractions.
 
-**Checkpoint (repair iterations only):** If the previous repair's score was lower than an earlier attempt's, rollback before applying the new fix:
+**Checkpoint (repair iterations):** If previous score regressed, rollback before applying:
 ```bash
 git checkout -- . && git clean -fd && git apply $SNAP_DIR/attempt-<best>.patch
 ```
 
 ### 4. Verify
 
-**If MODE = subagent:** Spawn a `general-purpose` subagent using the Verify Protocol briefing (see Subagent Protocols → Verify), passing the verify command, scoring formula, and loop pattern. Wait for the structured return (## Verify Results). Use the returned status, score, errors, and reward hacking flags to decide next step. Save a snapshot if score improved. If reward hacking flags are present → stop with `UNSAFE`.
+**Subagent:** Spawn `general-purpose` with Verify Protocol briefing. Use return to decide next step. Save snapshot if improved. Reward hacking flags → `UNSAFE`.
 
-**If MODE = inline:** Run the user-supplied command via `run_shell_command`. Capture stdout, stderr, exit code.
+**Inline:** Run verify command via `run_shell_command`. Capture stdout, stderr, exit code.
 
-**Parse the output into structured feedback:**
-- **Errors:** list of error messages with file:line references
-- **Test results:** pass/fail/skip counts
-- **Warnings:** non-fatal issues
-- **Score:** quantitative metric (e.g., "7/10 tests passing", "2 errors remaining")
+**Parse into:** Errors (file:line — message), Test results (pass/fail/skip), Warnings, Score.
 
-**Score calculation by verify type:**
-| Verify command type | Score formula | Example |
-|---------------------|---------------|---------|
-| Test runner (`pytest`, `npm test`, `go test`) | `passed / total` | 7/10 tests passing |
-| Linter/formatter (`ruff`, `eslint`, `gofmt`) | `1 / (1 + error_count)` — higher is better, approaches 1.0 as errors approach 0 | 1/(1+3) = 0.25 → fix 2 → 1/(1+1) = 0.5 → delta +0.25 |
-| Compiler/type checker (`tsc --noEmit`, `cargo check`) | `1 / (1 + error_count)` | 1/(1+5) = 0.17 |
-| Coverage tool (`coverage`, `c8`) | `coverage_percentage` | 85% |
-| Build command (`npm run build`, `make`) | Binary: `1` (pass) or `0` (fail) | 0 → 1 on fix |
-| Custom script | Count meaningful output lines as errors, use `1 / (1 + count)` | — |
+**Score by verify type:**
+| Type | Formula | Example |
+|---|---|---|
+| Test runner | `passed / total` | 7/10 |
+| Linter/formatter | `1 / (1 + error_count)` | 1/(1+3)=0.25 → 0.5 |
+| Compiler/type checker | `1 / (1 + error_count)` | 1/(1+5)=0.17 |
+| Coverage tool | `coverage_percentage` | 85% |
+| Build command | Binary 1/0 | 0 → 1 |
+| Custom script | `1 / (1 + meaningful_error_count)` | — |
 
-The goal: every verify type produces a comparable, directionally-correct number. Deltas between attempts show real progress.
+**Judge:** Pass = exit 0 AND output matches expected. Fail = anything else.
 
-**Judge:**
-- **Pass** — exit 0 AND output matches expected behavior
-- **Fail** — anything else
+**Reward hacking check:** Diff outside action space? Suspiciously large/unrelated diff? Weakened verify (fewer tests, broader assertions)? Modified test/CI files to pass? If detected → `UNSAFE`.
 
-**Check for reward hacking:**
-- Did the diff touch files outside the action space?
-- Did verify pass but the diff is suspiciously large or unrelated to the task?
-- Did the repair weaken the verify command (fewer tests, broader assertions, disabled checks)?
-- Did the repair modify test files or CI config to make tests pass?
-
-If reward hacking is detected, flag it and stop with status `UNSAFE`.
-
-**Track progress:**
-```
-## Progress Log
-| Attempt | Result | Score | Delta | Patch file      | Notes |
-|---------|--------|-------|-------|-----------------|-------|
-| 0       | FAIL   | 3/10  | —     | baseline.patch  | reference |
-| 1       | FAIL   | 5/10  | +2    | attempt-1.patch | fixed import error |
-| 2       | PASS   | 10/10 | +7    | attempt-2.patch | all tests passing |
-```
-
-**After each Verify run** (pass or fail), save a snapshot if the score improved over the previous best:
+Track in progress log. After each Verify, save snapshot if score improved:
 ```bash
 git add -A && git diff --cached > $SNAP_DIR/attempt-<N>.patch && git reset -q
 ```
 
 ### 5. Review (only on Verify Pass)
 
-**If MODE = subagent:** Spawn a `code-reviewer` subagent using the Review Protocol briefing (see Subagent Protocols → Review), passing the changed files (from Modify Results), action space (from Search Results), and verify status. Wait for the structured return (## Review Findings). Based on severity summary:
-- **clean** → proceed to Summarize (DONE)
-- **warning** → flag in Summarize as "Remaining risks", or fix small issues by looping back to Modify + Verify subagents
-- **critical** → stop with `OUT_OF_SCOPE` if issues need significant work, or fix and re-verify
+**Subagent:** Spawn `code-reviewer` with Review Protocol briefing. clean → DONE, warning → flag in Summarize or fix+re-verify, critical → `OUT_OF_SCOPE` if significant, or fix+re-verify.
 
-**If MODE = inline:** Self-critique the solution. Re-read the diff and run through each rubric:
+**Inline:** Self-critique against:
+- **Correctness:** Solves task or just passes tests? Edge cases uncovered?
+- **Security:** Hardcoded secrets, open endpoints, injection? Handles boundary input?
+- **Performance:** Debug artifacts, unused imports, algorithmic regressions?
+- **Coverage parity:** New feature → matching test? Reduced coverage?
+- **Minimalism:** Focused diff? Would pass human review?
 
-**Correctness:**
-- Does the solution actually solve the task, or just make tests pass?
-- Are there edge cases or failure modes not covered by tests?
-
-**Security:**
-- Does the diff introduce hardcoded secrets, open endpoints, or injection vectors?
-- Does it handle user input at system boundaries?
-
-**Performance:**
-- Are there stray `console.log`/`print` statements, unused imports, or debug artifacts?
-- Any obvious algorithmic regressions (e.g., O(n²) where O(n) was before)?
-
-**Coverage parity:**
-- If a new feature was added, was a matching test added — or did it pass only because existing tests didn't cover the new code?
-- Did the diff reduce test coverage (removed assertions, disabled checks)?
-
-**Minimalism:**
-- Is the diff minimal and focused, or does it include unrelated changes?
-- Would this change pass a human code review?
-
-If the review finds issues, either:
-- Fix them immediately (if small) and re-verify
-- Flag them in the Summarize as "Remaining risks"
-- Stop with status `OUT_OF_SCOPE` if the issues require significant additional work
+If issues: fix small + re-verify, flag in Summarize, or `OUT_OF_SCOPE` if significant.
 
 ### 6. Repair (only on Verify Fail)
-- Attempts so far: 0 → max **3**
-- **Context refresh:** If verify output reveals files or modules not covered by the original Search, re-run targeted search. In subagent mode: spawn a new `Explore` subagent scoped to the newly-revealed areas. In inline mode: use `grep_search`/`read_file`. Context is perishable — refresh after meaningful observations.
-- Diagnose the root cause from structured verify output (don't patch symptoms). This diagnosis stays with the main agent in both modes.
-- **Apply fix:**
-  - **Subagent mode:** Rollback to best-known-good patch if previous score regressed. Spawn a `general-purpose` subagent using the Modify Protocol briefing with the fix instructions. Then spawn a Verify subagent. Main agent checks the Verify return.
-  - **Inline mode:** Make the smallest fix that addresses the cause using `edit`/`write_file`. Re-run Verify directly.
-- **Sandbox rules:** Repair must never modify CI config or safety tooling. If the fix requires changing files outside the action space (unless those files were promoted via the escape hatch at Search), stop with status `OUT_OF_SCOPE`.
 
-**Human checkpoint after attempt 2 fails:**
-Before burning attempt 3, pause and consult the user. Use `ask_user_question` with a summary of what was tried and the agent's root cause analysis:
+Max **3** attempts. Context refresh: if verify reveals uncovered files/modules, re-run targeted search (subagent: spawn `Explore`; inline: `grep_search`/`read_file`). Diagnose root cause (don't patch symptoms) — diagnosis stays with main agent.
 
-```
-Repair attempts so far:
-  Attempt 1: <what was tried> → <score, what failed>
-  Attempt 2: <what was tried> → <score, what failed>
+**Apply fix:**
+- **Subagent:** Rollback to best-known-good if regressed. Spawn `general-purpose` with fix (Modify Protocol). Spawn Verify subagent. Check result.
+- **Inline:** Smallest fix via `edit`/`write_file`. Re-run Verify directly.
 
-Root cause assessment: <agent's diagnosis>
+**Sandbox:** Never modify CI config or safety tooling. If fix requires files outside action space (unless escape hatch) → `OUT_OF_SCOPE`.
 
-Best-known-good state: attempt-<N>.patch (<score>)
-```
+**Human checkpoint after attempt 2 fails** — `ask_user_question` with summary (attempt 1+2 results, root cause, best-known-good). Options: "Try different approach — <instructions>", "Stop — I'll take over" (→ BLOCKED), "One more attempt — specific fix" (→ attempt 3). If 3 attempts fail → BLOCKED.
 
-Offer these options:
-- "Try a different approach — <custom instructions from user>"
-- "Stop here — I'll take over manually" (→ Summarize as BLOCKED)
-- "One more attempt — you have a specific fix in mind" (→ proceed to attempt 3)
-
-If the user provides a new approach, apply it as attempt 3. If the user says stop, jump to Summarize with status `BLOCKED`. If the user gives a specific fix, proceed with attempt 3 using their guidance.
-
-- If 3 attempts all fail (including any user-guided attempt 3) → jump to Summarize with status `BLOCKED`
-
-**Solution archive (operational):** After each repair attempt, the Verify step saves a snapshot if the score improved. Before summarizing (especially on BLOCKED), rollback to the best-known-good patch:
+**Solution archive:** Before Summarizing (especially BLOCKED), rollback to best-known-good:
 ```bash
 git checkout -- . && git clean -fd && git apply $SNAP_DIR/attempt-<best>.patch
 ```
-If no attempt improved over baseline, rollback to clean: `git checkout -- . && git clean -fd`.
+If no attempt improved over baseline → `git checkout -- . && git clean -fd`.
 
 ### 7. Summarize
-Final report. Stop early and jump here if any stopping condition is met:
 
-- **DONE** — verify passes AND review finds no critical issues
-- **BLOCKED** — same failure 3× in a row, OR user stopped at human checkpoint, OR missing credentials/data, OR repair requires out-of-scope changes
-- **OUT_OF_SCOPE** — next repair would touch unrelated files or off-limits files (unless the task explicitly targets them — see Search step)
-- **UNSAFE** — required action is destructive (force-push, dropping tables, `rm -rf`, etc.) OR reward hacking detected — escalate to user, do not execute
-- **TIMEOUT** — time budget exceeded (if set by user)
+Stop early on any condition:
 
-Use this exact format:
+| Status | Trigger |
+|---|---|
+| **DONE** | Verify passes AND review clean |
+| **BLOCKED** | 3× failures, OR user stopped, OR missing credentials/data, OR out-of-scope repair |
+| **OUT_OF_SCOPE** | Next repair touches unrelated/off-limits files (unless escape hatch) |
+| **UNSAFE** | Destructive action (force-push, drop tables, `rm -rf`) OR reward hacking — escalate, don't execute |
+| **TIMEOUT** | Time budget exceeded |
 
+Format:
 ```
 ## Summary
-
 **Status:** DONE | BLOCKED | OUT_OF_SCOPE | UNSAFE | TIMEOUT
-**Task:** <one-line restatement>
-**Verify command:** `<the command>`
-**Time elapsed:** <duration>
+**Task:** <one-line>  |  **Verify:** `<cmd>`  |  **Time:** <duration>
 **Verify result:** PASS (attempts: N) | FAIL (attempts: 3/3)
 
-### Baseline
-- **Score:** <baseline metric>
-- **Status:** PASS | FAIL
-
-### Progress
-| Attempt | Result | Score | Delta | Patch file      | Notes |
-|---------|--------|-------|-------|-----------------|-------|
-| 0       | <status> | <score> | —   | baseline.patch  | reference |
-| 1       | <status> | <score> | <delta> | attempt-1.patch | <notes> |
-| ...     | ...    | ...   | ...   | ...             | ... |
-
-### State
-- **Final patch applied:** <yes — attempt-N.patch | no — rolled back to baseline | partial — attempt-K.patch (best score)>
-
-### Changes
-- `<file>`: <one-line description>
-- ...
-
-### Review notes
-- <review observations from Review step — self-critique in inline mode, code-reviewer findings in subagent mode>
-- <edge cases or risks identified>
-
-### Remaining risks
-- <anything that passed verify but is still uncertain>
+### Baseline: Score <metric>, Status PASS|FAIL
+### Progress: | Attempt | Result | Score | Delta | Patch | Notes |
+### State: Final patch — <attempt-N.patch | rolled back to baseline | attempt-K.patch (best)>
+### Changes: `<file>`: <description>
+### Review notes: <observations, edge cases, risks>
+### Remaining risks: <uncertainties that passed verify>
 ```
 
-**Cleanup:** Remove the snapshot directory:
-```bash
-rm -rf $SNAP_DIR
-```
+**Cleanup:** `rm -rf $SNAP_DIR`
 
 ## Anti-Patterns
 
-- **Thrashing** — cycling between two failure modes → narrow the diff, trigger the human checkpoint early (before attempt 3)
-- **Overfitting to tests** — tests pass but user-visible behavior is wrong → re-read the task, verify with a different angle (browser check, manual test, different test)
-- **Context drift** — plan no longer matches the code → re-run Search, update the plan
-- **Speculative rewrites** — large multi-file changes without a small-step verify path → split the work, run the loop on each piece
-- **Endless polishing** — continuing to revise after verify passes and review is clean → stop, ship it
-- **Unsafe autonomy** — agent runs destructive commands, rewrites unrelated files, or pushes without review → enforce action space boundaries, require human approval for off-limits file modifications, use UNSAFE status to escalate
+| Pattern | Signal | Action |
+|---|---|---|
+| **Thrashing** | Cycling between two failure modes | Narrow diff, human checkpoint before attempt 3 |
+| **Overfitting to tests** | Tests pass but behavior wrong | Re-read task, verify from different angle |
+| **Context drift** | Plan no longer matches code | Re-run Search, update plan |
+| **Speculative rewrites** | Large changes without small-step verify | Split work, loop on each piece |
+| **Endless polishing** | Continuing after verify+review clean | Stop, ship it |
+| **Unsafe autonomy** | Destructive commands, unrelated rewrites, push without review | Enforce action space, require human approval, use UNSAFE |
 
 ## Examples
 
-### Subagent mode flow (applies to any example below)
+### Subagent mode flow
 
-When MODE = subagent, steps 2–5 delegate to subagents. Here's how the Tactical example looks in subagent mode:
+When MODE = subagent, steps 2–5 delegate. Main agent: classifies (Scope Gate) → runs verify (Baseline) → decomposes + confirms (Plan) → spawns `Explore` (Search) → snapshots + spawns `general-purpose` (Modify) → spawns `general-purpose` (Verify) → diagnoses + spawns fix + Verify (Repair) → spawns `code-reviewer` (Review) → owns report (Summarize). Context stays clean: only structured summaries, not raw results/diffs/output.
 
-1. **Scope Gate:** same — main agent classifies.
-2. **Baseline:** same — main agent runs verify command directly.
-3. **Plan:** same — main agent decomposes and confirms with user (Medium scope).
-4. **Search:** main agent spawns `Explore` subagent → receives Search Results (action space, patterns, blockers).
-5. **Modify:** main agent takes snapshot, spawns `general-purpose` subagent with Search Results → receives Modify Results (files changed, edits applied).
-6. **Verify:** main agent spawns `general-purpose` subagent with verify command → receives Verify Results (PASS/FAIL, score, errors, reward hacking flags).
-7. **Repair:** main agent diagnoses root cause from Verify Results, spawns `general-purpose` subagent with fix instructions → spawns Verify subagent → checks result.
-8. **Review:** main agent spawns `code-reviewer` subagent → receives Review Findings (severity: clean/warning/critical).
-9. **Summarize:** same — main agent owns the report.
+### Tactical
 
-Main agent context stays clean: it holds only the structured summaries, not raw search results, diffs, or test output.
+*"Add a `/health` endpoint returning 200 `{ok: true}`. Verify: `pytest tests/test_health.py`."*
 
-### Tactical (single file, clear fix)
+1. **Scope Gate:** Tactical (single file, clear spec, test given)
+2. **Baseline:** 0/1 (file not found) → 3. **Plan:** add handler, add test, verify → 4. **Search:** editable=[`app.py`, `tests/test_health.py`], off-limits=[`pytest.ini`] → 5. **Modify:** add handler + test → 6. **Verify:** 0/1 (import error) → 7. **Repair:** fix import → 1/1 (+1) → 8. **Review:** minimal, covers happy path → 9. **Summarize:** DONE, 0/1 → 1/1
 
-User: *"Add a `/health` endpoint that returns 200 with `{ok: true}`. Verify with `pytest tests/test_health.py`."*
+### Medium (re-plan)
 
-1. **Scope Gate:** Single file change, clear spec, test path given → **Tactical**. No confirmation needed.
-2. **Baseline:** run pytest — fails (0/1 tests, file not found). Score: 0/1.
-3. **Plan:** (1) add route handler, (2) add test, (3) verify
-4. **Search:** read existing route patterns, find test fixtures. Action space: editable=[`app.py`, `tests/test_health.py`], read-only=[`conftest.py`], off-limits=[`pytest.ini`, other test files]
-5. **Modify:** add the handler, add the test
-6. **Verify:** run pytest — fails (0/1 tests, import error). Score: 0/1. Delta: 0.
-7. **Repair:** fix the import, re-run pytest — passes (1/1 tests). Score: 1/1. Delta: +1.
-8. **Review:** re-read diff — handler is minimal, test covers the happy path, no edge cases. Diff is clean.
-9. **Summarize:** status DONE, baseline 0/1, final 1/1, files changed, review notes
+*"Add rate limiting to all API routes. Verify: `npm test`."*
 
-### Medium (multi-file, re-plan triggered)
-
-User: *"Add rate limiting to all API routes. Verify with `npm test`."*
-
-1. **Scope Gate:** Multi-file (middleware + routes + config), design choice (per-route vs global, token bucket vs sliding window) → **Medium**.
-2. **Baseline:** run `npm test` — 45/45 passing. Score: 45/45. Status: PASS (green field).
-3. **Plan (v1):** (1) create `middleware/rateLimit.ts`, (2) apply globally in `app.ts`, (3) add config to `config.ts`, (4) write tests
-4. **Search:** discovers `app.ts` uses a plugin architecture, not middleware. Existing rate limiter already exists in `plugins/throttle.ts` but is disabled. → **Re-plan triggered.**
-5. **Plan (v2):** (1) enable `plugins/throttle.ts`, (2) configure limits in `config/throttle.json`, (3) add tests for throttle behavior
-6. **User confirms v2** — proceeds.
-7. **Search (v2):** read plugin registration, config schema, existing throttle tests
-8. **Modify → Verify → Repair** (standard loop)
-9. **Summarize:** status DONE, note re-plan in review notes
+1. **Scope Gate:** Medium (multi-file, design choice) → 2. **Baseline:** 45/45 PASS (green field) → 3. **Plan v1:** create `middleware/rateLimit.ts`, apply globally, add config, tests → 4. **Search:** discovers plugin architecture, existing disabled `plugins/throttle.ts` → **Re-plan** → 5. **Plan v2:** enable throttle plugin, configure limits, add tests → **User confirms** → 6–9. Standard loop → **Summarize:** DONE, note re-plan
 
 ### Strategic (escalated)
 
-User: *"Refactor the auth system from sessions to JWT with refresh tokens."*
+*"Refactor auth from sessions to JWT with refresh tokens."*
 
-1. **Scope Gate:** Spans auth middleware, session store, token management, database schema, all protected routes, frontend token handling → **Strategic**.
-2. **STOP.** Recommend: "This is a multi-concern architectural change. Run `/grill-with-docs` to nail down token strategy (JWT vs opaque, refresh rotation, revocation), then `/to-issues` to break it into vertical slices. Come back to `/agentic-coding-loop` for each slice."
+**Scope Gate:** Strategic (spans middleware, session store, token management, DB schema, routes, frontend) → **STOP.** Recommend `/grill-with-docs` for token strategy → `/to-issues` for vertical slices → return to `/agentic-coding-loop` per slice.
 
 ### BLOCKED with rollback
 
-User: *"Fix the failing integration tests in `tests/integration/`. Verify with `pytest tests/integration/`."*
+*"Fix failing integration tests. Verify: `pytest tests/integration/`."*
 
-1. **Scope Gate:** Single directory, clear verify → **Tactical**.
-2. **Baseline:** `pytest tests/integration/` — 4/8 passing. Score: 4/8. Save `baseline.patch`.
-3. **Plan → Search → Modify:** fix test imports and DB connection string.
-4. **Verify attempt 1:** 6/8 passing. Score: 6/8. Delta: +2. Save `attempt-1.patch`.
-5. **Repair attempt 1:** fix remaining 2 tests — change a shared fixture in `conftest.py`.
-6. **Verify attempt 2:** 5/8 passing. Score: 5/8. Delta: -1. **Regression.**
-   - `conftest.py` is off-limits (test infrastructure). Score dropped because the fixture change broke other tests.
-7. **Rollback:** `git checkout -- . && git clean -fd && git apply $SNAP_DIR/attempt-1.patch` (restores attempt-1 state: 6/8).
-8. **Human checkpoint:** Attempt 2 failed. Present summary to user:
-   - Attempt 1: fixed imports → 6/8 (+2)
-   - Attempt 2: fixture change regressed to 5/8 → rolled back to 6/8
-   - Root cause: remaining 2 tests need fixture refactor, but `conftest.py` is off-limits
-   - User chooses "Stop here" → BLOCKED
-9. **Summarize:** status BLOCKED. Final state: `attempt-1.patch` applied (6/8). Remaining 2 tests need fixture refactor (off-limits). Recommend `/grill-with-docs` or manual intervention.
+1. **Scope Gate:** Tactical → 2. **Baseline:** 4/8, save `baseline.patch` → 3–4. **Modify+Verify attempt 1:** 6/8 (+2), save `attempt-1.patch` → 5. **Repair attempt 2:** change fixture in `conftest.py` (off-limits) → 6/8 → **Verify:** 5/8 (−1, regression) → 7. **Rollback** to `attempt-1.patch` (6/8) → 8. **Human checkpoint:** root cause — remaining tests need fixture refactor (off-limits). User: "Stop" → 9. **Summarize:** BLOCKED, `attempt-1.patch` (6/8), recommend `/grill-with-docs`
 
 ## References
 
-This skill incorporates patterns from:
-- **EPOCH protocol** — baseline-first execution, round-level tracking
-- **STOP (Self-Taught Optimizer)** — quantitative utility functions, solution archiving, budget constraints
-- **autoresearch (Karpathy)** — fixed time budgets, metric-based iteration
-- **AI Scientist (Sakana AI)** — automated review, self-critique feedback loops
-- **SePO** — regression-avoidance, archive admission policy
-- **AlphaEvolve/AAR findings** — reward hacking detection, evaluation integrity
-- **Gödel Agent** — action space boundaries, self-referential improvement
+EPOCH (baseline-first, round tracking) · STOP (quantitative utility, archiving, budgets) · autoresearch (time budgets, metric iteration) · AI Scientist (automated review, self-critique) · SePO (regression avoidance, archive admission) · AlphaEvolve/AAR (reward hacking, evaluation integrity) · Gödel Agent (action space boundaries).
